@@ -6,6 +6,7 @@ from typing import Iterable, Optional
 import numpy as np
 import torch
 from sam3.model.data_misc import NestedTensor
+from sam3.model.device_utils import cuda_only_autocast
 from sam3.model.io_utils import load_video_frames
 from sam3.model.multiplex_utils import MultiplexState
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
@@ -95,11 +96,12 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         # the original video height and width, used for resizing final output scores
         inference_state["video_height"] = video_height
         inference_state["video_width"] = video_width
-        inference_state["device"] = torch.device("cuda")
+        model_device = next(self.parameters()).device
+        inference_state["device"] = model_device
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
-            inference_state["storage_device"] = torch.device("cuda")
+            inference_state["storage_device"] = model_device
         # inputs on each frame
         inference_state["point_inputs_per_obj"] = {}
         inference_state["mask_inputs_per_obj"] = {}
@@ -1417,8 +1419,8 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
                     )
 
                 if prev_out is not None and prev_out["pred_masks"] is not None:
-                    prev_sam_mask_logits_singleton = prev_out["pred_masks"].cuda(
-                        non_blocking=True
+                    prev_sam_mask_logits_singleton = prev_out["pred_masks"].to(
+                        inference_state["device"], non_blocking=True
                     )
                     prev_sam_mask_logits_singleton = torch.clamp(
                         prev_sam_mask_logits_singleton, -32.0, 32.0
@@ -2634,7 +2636,12 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         )
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
-            image = inference_state["images"][frame_idx].cuda().float().unsqueeze(0)
+            image = (
+                inference_state["images"][frame_idx]
+                .to(inference_state["device"])
+                .float()
+                .unsqueeze(0)
+            )
             # TODO: We should optimize this because we don't always need all three outs
             backbone_out = self.forward_image(
                 NestedTensor(tensors=image, mask=None),
@@ -3199,7 +3206,7 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
                 obj_output_dict["non_cond_frame_outputs"].pop(t, None)
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @cuda_only_autocast(dtype=torch.bfloat16)
     def warm_up_compilation(
         self, offload_video_to_cpu=False, offload_state_to_cpu=False
     ):
@@ -3248,11 +3255,12 @@ class Sam3VideoTrackingMultiplexDemo(VideoTrackingMultiplexDemo):
         # the original video height and width, used for resizing final output scores
         inference_state["video_height"] = video_height
         inference_state["video_width"] = video_width
-        inference_state["device"] = torch.device("cuda")
+        model_device = next(self.parameters()).device
+        inference_state["device"] = model_device
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
-            inference_state["storage_device"] = torch.device("cuda")
+            inference_state["storage_device"] = model_device
         # inputs on each frame
         inference_state["point_inputs_per_obj"] = {}
         inference_state["mask_inputs_per_obj"] = {}

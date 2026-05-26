@@ -14,9 +14,17 @@ from torchvision.transforms import v2
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
+    def __init__(self, model, resolution=1008, device=None, confidence_threshold=0.5):
         self.model = model
         self.resolution = resolution
+        if device is None:
+            # Prefer the device the model is actually on
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                from sam3.model.device_utils import get_default_device
+
+                device = get_default_device()
         self.device = device
         self.transform = v2.Compose(
             [

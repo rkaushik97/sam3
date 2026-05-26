@@ -12,6 +12,7 @@ from sam3 import perflib
 from sam3.logger import get_logger
 from sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
 from sam3.model.data_misc import BatchedDatapoint
+from sam3.model.device_utils import cuda_only_autocast
 from sam3.model.sam3_multiplex_base import MaskletConfirmationStatus, Sam3MultiplexBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.sam3_video_inference import is_image_type
@@ -220,6 +221,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             video_loader_type = "cv2"
         else:
             video_loader_type = "cv2"
+        model_device = next(self.parameters()).device
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
@@ -228,11 +230,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            compute_device=model_device,
         )
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
-        inference_state["device"] = torch.device("cuda")
+        inference_state["device"] = model_device
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
         inference_state["constants"] = {}
@@ -715,7 +718,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
 
             # slice those valid entries from the original outputs
             keep_idx = torch.nonzero(keep, as_tuple=True)[0]
-            keep_idx_gpu = keep_idx.pin_memory().to(
+            if torch.cuda.is_available():
+                keep_idx = keep_idx.pin_memory()
+            keep_idx_gpu = keep_idx.to(
                 device=out_binary_masks.device, non_blocking=True
             )
 
@@ -1027,7 +1032,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             if out_masks.shape[0] > 1:
                 # Copy sam2_probs to CPU pinned memory then back to GPU for the operation
                 out_sam2_probs_cpu = torch.empty(
-                    out_sam2_probs.shape, dtype=out_sam2_probs.dtype, pin_memory=True
+                    out_sam2_probs.shape,
+                    dtype=out_sam2_probs.dtype,
+                    pin_memory=torch.cuda.is_available(),
                 )
                 out_sam2_probs_cpu.copy_(out_sam2_probs, non_blocking=True)
                 out_masks = (
@@ -1106,20 +1113,20 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     batched_buffer_size,
                     dtype=torch.int64,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=torch.cuda.is_available(),
                 ),
                 "out_probs": torch.zeros(
                     batched_buffer_size,
                     dtype=torch.float32,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=torch.cuda.is_available(),
                 ),
                 "out_boxes_xywh": torch.zeros(
                     batched_buffer_size,
                     4,
                     dtype=torch.float32,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=torch.cuda.is_available(),
                 ),
                 "out_binary_masks": torch.zeros(
                     batched_buffer_size,
@@ -1127,7 +1134,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     W_video,
                     dtype=bool,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=torch.cuda.is_available(),
                 ),
             }
             if self.running_in_prod:
@@ -1136,7 +1143,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     2,
                     dtype=torch.float32,
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=torch.cuda.is_available(),
                 )
 
         self.buffer_cpu_batched["out_obj_ids"][:total_objects].copy_(final_obj_ids)
@@ -1613,7 +1620,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         return inference_state
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @cuda_only_autocast(dtype=torch.bfloat16)
     def warm_up_compilation(self):
         """
         Warm up the model by running a dummy inference to compile the model. This is
@@ -1752,7 +1759,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         backbone_out.update(text_outputs)
         return backbone_out
 
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @cuda_only_autocast(dtype=torch.bfloat16)
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
         """This method is only used for benchmark eval (not used in the demo)."""
         # set the model to single GPU for benchmark evaluation (to be compatible with trainer)

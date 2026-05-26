@@ -279,7 +279,9 @@ class TransformerDecoder(nn.Module):
 
             if resolution is not None and stride is not None:
                 feat_size = resolution // stride
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+                from sam3.model.device_utils import get_default_device
+
+                device = get_default_device()
                 coords_h, coords_w = self._get_coords(
                     feat_size, feat_size, device=device
                 )
@@ -1050,7 +1052,9 @@ class SimpleRoPEAttention(nn.Module):
         self.compute_cis = partial(
             compute_axial_cis, dim=d_model // num_heads, theta=rope_theta
         )
-        device = torch.device("cuda") if torch.cuda.is_available() else None
+        from sam3.model.device_utils import get_default_device
+
+        device = get_default_device()
         self.freqs_cis = self.compute_cis(
             end_x=feat_sizes[0], end_y=feat_sizes[1], device=device
         )

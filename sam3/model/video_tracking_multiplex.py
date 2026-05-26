@@ -533,10 +533,10 @@ class VideoTrackingMultiplex(nn.Module):
             return torch.zeros(len(rel_pos_list), self.mem_dim, device=device)
 
         t_diff_max = max_abs_pos - 1 if max_abs_pos is not None else 1
-        pos_enc = (
-            torch.tensor(rel_pos_list).pin_memory().to(device=device, non_blocking=True)
-            / t_diff_max
-        )
+        _t = torch.tensor(rel_pos_list)
+        if torch.cuda.is_available():
+            _t = _t.pin_memory()
+        pos_enc = _t.to(device=device, non_blocking=True) / t_diff_max
         if self.sincos_tpos_enc:
             tpos_dim = (
                 self.hidden_dim if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
@@ -1402,11 +1402,11 @@ class VideoTrackingMultiplex(nn.Module):
                     continue
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = feats.cuda(non_blocking=True)
+                feats = feats.to(device, non_blocking=True)
                 if feats.dim() == 5:
                     feats = multiplex_state.demux(feats).contiguous()
                     prev["maskmem_features"] = (
-                        feats.cpu() if not feats.is_cuda else feats
+                        feats.cpu() if feats.device != device else feats
                     )
 
                 if feats.shape[0] == 0:
@@ -1421,11 +1421,13 @@ class VideoTrackingMultiplex(nn.Module):
                 maskmem_enc = maskmem_pos_list[-1]
                 if maskmem_enc is None:
                     continue
-                maskmem_enc = maskmem_enc.cuda(non_blocking=True)
+                maskmem_enc = maskmem_enc.to(device, non_blocking=True)
                 if maskmem_enc.dim() == 5:
                     maskmem_enc = multiplex_state.demux(maskmem_enc).contiguous()
                     prev["maskmem_pos_enc"][-1] = (
-                        maskmem_enc.cpu() if not maskmem_enc.is_cuda else maskmem_enc
+                        maskmem_enc.cpu()
+                        if maskmem_enc.device != device
+                        else maskmem_enc
                     )
                 maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
 
@@ -1446,8 +1448,8 @@ class VideoTrackingMultiplex(nn.Module):
 
                 if self.save_image_features:
                     # image features are in (HW)BC
-                    image_feat = prev["image_features"].cuda()
-                    image_pos_embed = prev["image_pos_enc"].cuda() + tpos_enc
+                    image_feat = prev["image_features"].to(device)
+                    image_pos_embed = prev["image_pos_enc"].to(device) + tpos_enc
                     to_cat_image_feat.append(image_feat)
                     to_cat_image_pos_embed.append(image_pos_embed)
 

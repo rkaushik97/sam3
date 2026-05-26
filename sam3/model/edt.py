@@ -2,11 +2,24 @@
 
 # pyre-unsafe
 
-"""Triton kernel for euclidean distance transform (EDT)"""
+"""Triton kernel for euclidean distance transform (EDT).
+
+Triton requires CUDA. We import it lazily so the rest of the package keeps
+working on MPS / CPU; the ``edt`` dispatcher at the bottom of this module
+falls back to a CPU implementation (OpenCV) when CUDA is unavailable.
+"""
 
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover — Triton requires CUDA at import time.
+    triton = None
+    tl = None
+    _HAS_TRITON = False
 
 """
 Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
@@ -52,68 +65,90 @@ Overall, despite being quite naive, this implementation is roughly 5.5x faster t
 """
 
 
-@triton.jit
-def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
-    # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
-    # It can be applied horizontally or vertically depending if we're doing the first or second stage.
-    # It's parallelized across batch+row (or batch+col if horizontal=False)
-    # TODO: perhaps the implementation can be revisited if/when local gather/scatter become available in triton
-    batch_id = tl.program_id(axis=0)
-    if horizontal:
-        row_id = tl.program_id(axis=1)
-        block_start = (batch_id * height * width) + row_id * width
-        length = width
-        stride = 1
-    else:
-        col_id = tl.program_id(axis=1)
-        block_start = (batch_id * height * width) + col_id
-        length = height
-        stride = width
+if _HAS_TRITON:
 
-    # This will be the index of the right most parabola in the envelope ("the top of the stack")
-    k = 0
-    for q in range(1, length):
-        # Read the function value at the current location. Note that we're doing a singular read, not very efficient
-        cur_input = tl.load(inputs_ptr + block_start + (q * stride))
-        # location of the parabola on top of the stack
-        r = tl.load(v + block_start + (k * stride))
-        # associated boundary
-        z_k = tl.load(z + block_start + (k * stride))
-        # value of the function at the parabola location
-        previous_input = tl.load(inputs_ptr + block_start + (r * stride))
-        # intersection between the two parabolas
-        s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
+    @triton.jit
+    def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
+        # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
+        # It can be applied horizontally or vertically depending if we're doing the first or second stage.
+        # It's parallelized across batch+row (or batch+col if horizontal=False)
+        # TODO: perhaps the implementation can be revisited if/when local gather/scatter become available in triton
+        batch_id = tl.program_id(axis=0)
+        if horizontal:
+            row_id = tl.program_id(axis=1)
+            block_start = (batch_id * height * width) + row_id * width
+            length = width
+            stride = 1
+        else:
+            col_id = tl.program_id(axis=1)
+            block_start = (batch_id * height * width) + col_id
+            length = height
+            stride = width
 
-        # we'll pop as many parabolas as required
-        while s <= z_k and k - 1 >= 0:
-            k = k - 1
+        # This will be the index of the right most parabola in the envelope ("the top of the stack")
+        k = 0
+        for q in range(1, length):
+            # Read the function value at the current location. Note that we're doing a singular read, not very efficient
+            cur_input = tl.load(inputs_ptr + block_start + (q * stride))
+            # location of the parabola on top of the stack
             r = tl.load(v + block_start + (k * stride))
+            # associated boundary
             z_k = tl.load(z + block_start + (k * stride))
+            # value of the function at the parabola location
             previous_input = tl.load(inputs_ptr + block_start + (r * stride))
+            # intersection between the two parabolas
             s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
 
-        # Store the new one
-        k = k + 1
-        tl.store(v + block_start + (k * stride), q)
-        tl.store(z + block_start + (k * stride), s)
-        if k + 1 < length:
-            tl.store(z + block_start + ((k + 1) * stride), 1e9)
+            # we'll pop as many parabolas as required
+            while s <= z_k and k - 1 >= 0:
+                k = k - 1
+                r = tl.load(v + block_start + (k * stride))
+                z_k = tl.load(z + block_start + (k * stride))
+                previous_input = tl.load(inputs_ptr + block_start + (r * stride))
+                s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
 
-    # Last step, we read the envelope to find the min in every location
-    k = 0
-    for q in range(length):
-        while (
-            k + 1 < length
-            and tl.load(
-                z + block_start + ((k + 1) * stride), mask=(k + 1) < length, other=q
-            )
-            < q
-        ):
-            k += 1
-        r = tl.load(v + block_start + (k * stride))
-        d = q - r
-        old_value = tl.load(inputs_ptr + block_start + (r * stride))
-        tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
+            # Store the new one
+            k = k + 1
+            tl.store(v + block_start + (k * stride), q)
+            tl.store(z + block_start + (k * stride), s)
+            if k + 1 < length:
+                tl.store(z + block_start + ((k + 1) * stride), 1e9)
+
+        # Last step, we read the envelope to find the min in every location
+        k = 0
+        for q in range(length):
+            while (
+                k + 1 < length
+                and tl.load(
+                    z + block_start + ((k + 1) * stride),
+                    mask=(k + 1) < length,
+                    other=q,
+                )
+                < q
+            ):
+                k += 1
+            r = tl.load(v + block_start + (k * stride))
+            d = q - r
+            old_value = tl.load(inputs_ptr + block_start + (r * stride))
+            tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
+
+
+def _edt_cpu_fallback(data: torch.Tensor) -> torch.Tensor:
+    """CPU/MPS fallback for the Triton EDT kernel, using OpenCV per slice.
+
+    Slower than the Triton kernel but op-for-op equivalent to the Triton path,
+    which itself targets ``cv2.distanceTransform(_, cv2.DIST_L2, 0)``.
+    """
+    import cv2
+    import numpy as np
+
+    assert data.dim() == 3
+    orig_device = data.device
+    np_in = data.detach().to("cpu").to(torch.uint8).numpy()
+    out = np.empty_like(np_in, dtype=np.float32)
+    for i in range(np_in.shape[0]):
+        out[i] = cv2.distanceTransform(np_in[i], cv2.DIST_L2, 0)
+    return torch.from_numpy(out).to(orig_device)
 
 
 def edt_triton(data: torch.Tensor):
@@ -128,7 +163,8 @@ def edt_triton(data: torch.Tensor):
         It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
     """
     assert data.dim() == 3
-    assert data.is_cuda
+    if not data.is_cuda or not _HAS_TRITON:
+        return _edt_cpu_fallback(data)
     B, H, W = data.shape
     data = data.contiguous()
 

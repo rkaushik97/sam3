@@ -108,6 +108,35 @@ pip install einops ninja && pip install flash-attn-3 --no-deps --index-url https
 pip install git+https://github.com/ronghanghu/cc_torch.git
 ```
 
+### Apple Silicon (M1/M2/M3) support
+
+SAM 3 inference also runs on Apple Silicon via PyTorch's MPS backend. Build the model
+the same way; the builder picks `cuda` → `mps` → `cpu` automatically, or pass
+`device="mps"` explicitly:
+
+```python
+from sam3.model_builder import build_sam3_image_model, build_sam3_predictor
+img_model = build_sam3_image_model(device="mps")           # image
+predictor = build_sam3_predictor(version="sam3.1", device="mps")  # video
+```
+
+Install instructions on a Mac:
+
+```bash
+conda create -n sam3 python=3.12
+conda activate sam3
+pip install torch torchvision        # ships with MPS, no CUDA flag needed
+pip install -e .
+```
+
+Caveats on MPS:
+- We default to fp32 (no bf16 autocast); MPS bf16 has gaps that cause incorrect
+  outputs on some attention kernels. Expect ~2× slower than equivalent CUDA bf16.
+- Optimizations that are CUDA-only — FlashAttention-3, Triton NMS / connected-components,
+  `torch.compile` — are skipped silently with a one-time warning. CPU/MPS fallbacks
+  produce numerically identical results, just slower.
+- Multi-GPU / NCCL inference is CUDA-only. `gpus_to_use=...` is ignored on MPS.
+
 ## Getting Started
 
 ⚠️ Before using SAM 3, please request access to the checkpoints on the SAM 3

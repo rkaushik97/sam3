@@ -33,10 +33,14 @@ SAM3_COLLECTIVE_OP_TIMEOUT_SEC = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC",
 
 logger = get_logger(__name__)
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+if torch.cuda.is_available():
+    try:
+        if torch.cuda.get_device_properties(0).major >= 8:
+            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
 
 
 class Sam3MultiplexTrackerPredictor(nn.Module):
@@ -167,9 +171,12 @@ class Sam3MultiplexTrackerPredictor(nn.Module):
         self.model = model
         self.per_obj_inference = per_obj_inference
         self.fill_hole_area = fill_hole_area
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()  # keep using for the entire model process
+        # use bfloat16 inference for Flash Attention kernel (CUDA only)
+        if torch.cuda.is_available():
+            self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            self.bf16_context.__enter__()  # keep using for the entire model process
+        else:
+            self.bf16_context = None
 
     def __getattr__(self, name):
         # Expose all attributes of the underlying model
@@ -2234,11 +2241,12 @@ class Sam3MultiplexBase(Sam3VideoBase):
         )
 
         # Suppress if: keep_alive <= 0 AND not hotstart-only mode AND not removed
+        _flag = torch.tensor(not self.suppress_unmatched_only_within_hotstart)
+        if torch.cuda.is_available():
+            _flag = _flag.pin_memory()
         suppress_by_unmatch = (
             (trk_keep_alive <= 0)
-            & torch.tensor(not self.suppress_unmatched_only_within_hotstart)
-            .pin_memory()
-            .to(device=device, non_blocking=True)
+            & _flag.to(device=device, non_blocking=True)
             & ~removed_mask
             & ~remove_by_unmatch
         )
@@ -2500,10 +2508,11 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 continue
             # Get the local high-res masks and object score logits for this inference state
             if self.is_multiplex and self.tracker.is_multiplex_dynamic:
-                local_idx = (
-                    torch.tensor(object_idx_assignment[state_i])
-                    .pin_memory()
-                    .to(device=high_res_masks.device, non_blocking=True)
+                _local_idx = torch.tensor(object_idx_assignment[state_i])
+                if torch.cuda.is_available():
+                    _local_idx = _local_idx.pin_memory()
+                local_idx = _local_idx.to(
+                    device=high_res_masks.device, non_blocking=True
                 )
                 local_high_res_masks = high_res_masks[local_idx]
                 local_object_score_logits = object_score_logits[local_idx]
@@ -2853,6 +2862,9 @@ class Sam3MultiplexPredictorWrapper(Sam3MultiplexTrackerPredictor):
         self.is_multiplex = is_multiplex
         self.is_multiplex_dynamic = is_multiplex_dynamic
 
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()
+        # use bfloat16 inference for Flash Attention kernel (CUDA only)
+        if torch.cuda.is_available():
+            self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            self.bf16_context.__enter__()
+        else:
+            self.bf16_context = None

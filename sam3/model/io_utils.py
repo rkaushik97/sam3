@@ -28,6 +28,16 @@ IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]
 VIDEO_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".webm"]
 
 
+def _resolve_compute_device(
+    compute_device: Optional[Union[str, torch.device]],
+) -> torch.device:
+    if compute_device is not None:
+        return torch.device(compute_device)
+    from sam3.model.device_utils import get_default_device
+
+    return get_default_device()
+
+
 def load_resource_as_video_frames(
     resource_path: Union[str, list],
     image_size: int,
@@ -36,11 +46,13 @@ def load_resource_as_video_frames(
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
+    compute_device: Optional[Union[str, torch.device]] = None,
 ) -> tuple[Any, int, int]:
     """
     Load video frames from either a video or an image (as a single-frame video).
     Alternatively, if input is a list of PIL images, convert its format
     """
+    compute_device = _resolve_compute_device(compute_device)
     if isinstance(resource_path, list):
         img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
         img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
@@ -65,7 +77,7 @@ def load_resource_as_video_frames(
             images.append(img)
         images = torch.stack(images)
         if not offload_video_to_cpu:
-            images = images.cuda()
+            images = images.to(compute_device)
         return images, orig_height, orig_width
 
     is_image = (
@@ -79,6 +91,7 @@ def load_resource_as_video_frames(
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
+            compute_device=compute_device,
         )
     else:
         return load_video_frames(
@@ -89,6 +102,7 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            compute_device=compute_device,
         )
 
 
@@ -98,17 +112,19 @@ def load_image_as_single_frame_video(
     offload_video_to_cpu: bool,
     img_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
+    compute_device: Optional[Union[str, torch.device]] = None,
 ) -> tuple[torch.Tensor, int, int]:
     """Load an image as a single-frame video."""
+    compute_device = _resolve_compute_device(compute_device)
     images, image_height, image_width = _load_img_as_tensor(image_path, image_size)
     images = images.unsqueeze(0).half()
 
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
     if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -123,23 +139,34 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    compute_device: Optional[Union[str, torch.device]] = None,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
     the model and are loaded to GPU if offload_video_to_cpu=False. This is used by the demo.
     """
+    compute_device = _resolve_compute_device(compute_device)
     assert isinstance(video_path, str)
     if video_path.startswith("<load-dummy-video"):
         # Check for pattern <load-dummy-video-N> where N is an integer
         match = re.match(r"<load-dummy-video-(\d+)>", video_path)
         num_frames = int(match.group(1)) if match else 60
-        return load_dummy_video(image_size, offload_video_to_cpu, num_frames=num_frames)
+        return load_dummy_video(
+            image_size,
+            offload_video_to_cpu,
+            num_frames=num_frames,
+            compute_device=compute_device,
+        )
     elif video_path.startswith("<load-zero-video"):
         # Check for pattern <load-zero-video-N> where N is an integer
         match = re.match(r"<load-zero-video-(\d+)>", video_path)
         num_frames = int(match.group(1)) if match else 60
         return load_dummy_video(
-            image_size, offload_video_to_cpu, num_frames=num_frames, do_zeros=True
+            image_size,
+            offload_video_to_cpu,
+            num_frames=num_frames,
+            do_zeros=True,
+            compute_device=compute_device,
         )
     elif os.path.isdir(video_path):
         return load_video_frames_from_image_folder(
@@ -149,6 +176,7 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             async_loading_frames=async_loading_frames,
+            compute_device=compute_device,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
         return load_video_frames_from_video_file(
@@ -159,6 +187,7 @@ def load_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            compute_device=compute_device,
         )
     else:
         # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
@@ -172,6 +201,7 @@ def load_video_frames(
                 img_std=img_std,
                 async_loading_frames=async_loading_frames,
                 video_loader_type=video_loader_type,
+                compute_device=compute_device,
             )
         except Exception as e:
             raise NotImplementedError(
@@ -187,10 +217,12 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    compute_device: Optional[Union[str, torch.device]] = None,
 ):
     """
     Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
     """
+    compute_device = _resolve_compute_device(compute_device)
     frame_names = [
         p
         for p in os.listdir(image_folder)
@@ -214,7 +246,12 @@ def load_video_frames_from_image_folder(
 
     if async_loading_frames:
         lazy_images = AsyncImageFrameLoader(
-            img_paths, image_size, offload_video_to_cpu, img_mean, img_std
+            img_paths,
+            image_size,
+            offload_video_to_cpu,
+            img_mean,
+            img_std,
+            compute_device=compute_device,
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
@@ -226,9 +263,9 @@ def load_video_frames_from_image_folder(
     ):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -245,8 +282,10 @@ def load_video_frames_from_video_file(
     gpu_acceleration=False,
     gpu_device=None,
     video_loader_type="cv2",
+    compute_device: Optional[Union[str, torch.device]] = None,
 ):
     """Load the video frames from a video file."""
+    compute_device = _resolve_compute_device(compute_device)
     if video_loader_type == "cv2":
         return load_video_frames_from_video_file_using_cv2(
             video_path=video_path,
@@ -254,6 +293,7 @@ def load_video_frames_from_video_file(
             img_mean=img_mean,
             img_std=img_std,
             offload_video_to_cpu=offload_video_to_cpu,
+            compute_device=compute_device,
         )
     elif video_loader_type == "torchcodec":
         logger.info("Using torchcodec to load video file")
@@ -265,6 +305,7 @@ def load_video_frames_from_video_file(
             img_std=img_std,
             gpu_acceleration=gpu_acceleration,
             gpu_device=gpu_device,
+            compute_device=compute_device,
         )
         # The `AsyncVideoFileLoaderWithTorchCodec` class always loads the videos asynchronously,
         # so we just wait for its loading thread to finish if async_loading_frames=False.
@@ -283,6 +324,7 @@ def load_video_frames_from_video_file_using_cv2(
     img_mean: tuple = (0.5, 0.5, 0.5),
     img_std: tuple = (0.5, 0.5, 0.5),
     offload_video_to_cpu: bool = False,
+    compute_device: Optional[Union[str, torch.device]] = None,
 ) -> torch.Tensor:
     """
     Load video from path, convert to normalized tensor with specified preprocessing
@@ -298,6 +340,7 @@ def load_video_frames_from_video_file_using_cv2(
     """
     import cv2  # delay OpenCV import to avoid unnecessary dependency
 
+    compute_device = _resolve_compute_device(compute_device)
     # Initialize video capture
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -338,26 +381,33 @@ def load_video_frames_from_video_file_using_cv2(
     img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
     img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
     if not offload_video_to_cpu:
-        video_tensor = video_tensor.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        video_tensor = video_tensor.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
     # normalize by mean and std
     video_tensor -= img_mean
     video_tensor /= img_std
     return video_tensor, original_height, original_width
 
 
-def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60, do_zeros=False):
+def load_dummy_video(
+    image_size,
+    offload_video_to_cpu,
+    num_frames=60,
+    do_zeros=False,
+    compute_device: Optional[Union[str, torch.device]] = None,
+):
     """
     Load a dummy video with random frames for testing and compilation warmup purposes.
     """
+    compute_device = _resolve_compute_device(compute_device)
     video_height, video_width = 480, 640  # dummy original video sizes
     if not do_zeros:
         images = torch.randn(num_frames, 3, image_size, image_size, dtype=torch.float16)
     else:
         images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
     if not offload_video_to_cpu:
-        images = images.cuda()
+        images = images.to(compute_device)
     return images, video_height, video_width
 
 
@@ -377,12 +427,21 @@ class AsyncImageFrameLoader:
     A list of video frames to be load asynchronously without blocking session start.
     """
 
-    def __init__(self, img_paths, image_size, offload_video_to_cpu, img_mean, img_std):
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        compute_device: Optional[Union[str, torch.device]] = None,
+    ):
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
         self.img_mean = img_mean
         self.img_std = img_std
+        self.compute_device = _resolve_compute_device(compute_device)
         # items in `self._images` will be loaded asynchronously
         self.images = [None] * len(img_paths)
         # catch and raise any exceptions in the async loading thread
@@ -428,7 +487,7 @@ class AsyncImageFrameLoader:
         img -= self.img_mean
         img /= self.img_std
         if not self.offload_video_to_cpu:
-            img = img.cuda()
+            img = img.to(self.compute_device)
         self.images[index] = img
         return img
 
@@ -548,18 +607,33 @@ class AsyncVideoFileLoaderWithTorchCodec:
         gpu_acceleration: bool = True,
         gpu_device: Optional[torch.device] = None,
         use_rand_seek_in_loading: bool = False,
+        compute_device: Optional[Union[str, torch.device]] = None,
     ) -> None:
-        # Check and possibly infer the output device (and also get its GPU id when applicable)
+        # TorchCodec GPU acceleration is CUDA-only. On non-CUDA backends, force CPU decode
+        # and place the resulting frames on the user-requested compute_device.
+        compute_device = _resolve_compute_device(compute_device)
+        if gpu_acceleration and compute_device.type != "cuda":
+            from sam3.model.device_utils import warn_mps_fallback
+
+            warn_mps_fallback(
+                "torchcodec GPU decode", f"requires CUDA, got {compute_device.type}"
+            )
+            gpu_acceleration = False
         assert gpu_device is None or gpu_device.type == "cuda"
-        gpu_id = (
-            gpu_device.index
-            if gpu_device is not None and gpu_device.index is not None
-            else torch.cuda.current_device()
-        )
+        if gpu_device is not None or gpu_acceleration:
+            gpu_id = (
+                gpu_device.index
+                if gpu_device is not None and gpu_device.index is not None
+                else torch.cuda.current_device()
+            )
+        else:
+            gpu_id = None
         if offload_video_to_cpu:
             out_device = torch.device("cpu")
+        elif gpu_device is not None:
+            out_device = gpu_device
         else:
-            out_device = torch.device("cuda") if gpu_device is None else gpu_device
+            out_device = compute_device
         self.out_device = out_device
         self.gpu_acceleration = gpu_acceleration
         self.gpu_id = gpu_id

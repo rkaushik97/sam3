@@ -44,12 +44,22 @@ class Sam3MultiplexVideoPredictor(Sam3BasePredictor):
         self.default_output_prob_thresh = default_output_prob_thresh
         self.async_loading_frames = async_loading_frames
 
-        # turn on tfloat32 for Ampere GPUs
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()
+        from sam3.model.device_utils import setup_tf32
+
+        # turn on tfloat32 for Ampere GPUs (no-op on MPS/CPU)
+        setup_tf32()
+        # use bfloat16 inference for Flash Attention kernel (CUDA only)
+        if torch.cuda.is_available():
+            self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            self.bf16_context.__enter__()
+        else:
+            self.bf16_context = None
+        # track which device the wrapped model lives on so the base predictor
+        # can pick the right autocast for add_prompt
+        try:
+            self.device = next(self.model.parameters()).device
+        except StopIteration:
+            self.device = torch.device("cpu")
 
         if warm_up:
             self.model._warm_up_complete = False

@@ -34,11 +34,17 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         video_loader_type="cv2",
         apply_temporal_disambiguation: bool = True,
         compile: bool = False,
+        device=None,
     ):
         super().__init__()
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
+        from sam3.model.device_utils import get_default_device
         from sam3.model_builder import build_sam3_video_model
+
+        if device is None:
+            device = get_default_device()
+        self.device = torch.device(device)
 
         self.model = (
             build_sam3_video_model(
@@ -49,8 +55,9 @@ class Sam3VideoPredictor(Sam3BasePredictor):
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
                 compile=compile,
+                device=self.device,
             )
-            .cuda()
+            .to(self.device)
             .eval()
         )
 
@@ -79,26 +86,50 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             nf = s["state"]["num_frames"]
             live_session_strs.append(f"'{sid}' ({nf} frames)")
         joined = ", ".join(live_session_strs)
-        mem_alloc = torch.cuda.memory_allocated() // 1024**2
-        mem_res = torch.cuda.memory_reserved() // 1024**2
-        max_alloc = torch.cuda.max_memory_allocated() // 1024**2
-        max_res = torch.cuda.max_memory_reserved() // 1024**2
-        return (
-            f"live sessions: [{joined}], GPU memory: "
-            f"{mem_alloc} MiB used and {mem_res} MiB reserved"
-            f" (max over time: {max_alloc} MiB used and {max_res} MiB reserved)"
-        )
+        if torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() // 1024**2
+            mem_res = torch.cuda.memory_reserved() // 1024**2
+            max_alloc = torch.cuda.max_memory_allocated() // 1024**2
+            max_res = torch.cuda.max_memory_reserved() // 1024**2
+            return (
+                f"live sessions: [{joined}], GPU memory: "
+                f"{mem_alloc} MiB used and {mem_res} MiB reserved"
+                f" (max over time: {max_alloc} MiB used and {max_res} MiB reserved)"
+            )
+        return f"live sessions: [{joined}] (no CUDA memory stats on {getattr(self, 'device', 'cpu')})"
 
     def _get_torch_and_gpu_properties(self):
         """Get a string for PyTorch and GPU properties."""
-        return (
-            f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
-            f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
-        )
+        if torch.cuda.is_available():
+            return (
+                f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
+                f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
+            )
+        return f"torch: {torch.__version__}, device: {getattr(self, 'device', 'cpu')}"
 
 
 class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
     def __init__(self, *model_args, gpus_to_use=None, **model_kwargs):
+        # Multi-GPU path is CUDA/NCCL-only. On MPS or CPU, fall back to single-device
+        # init via the base class — multi-GPU isn't meaningful there.
+        if not torch.cuda.is_available():
+            from sam3.model.device_utils import get_default_device
+
+            if gpus_to_use is not None:
+                logger.warning(
+                    "gpus_to_use is ignored on non-CUDA backends; using single-device mode."
+                )
+            self.gpus_to_use = []
+            self.rank = 0
+            self.world_size = 1
+            self.rank_str = "rank=0 with world_size=1"
+            self.has_shutdown = False
+            super().__init__(*model_args, **model_kwargs)
+            # base class sets self.device from build_sam3_video_model
+            if not hasattr(self, "device"):
+                self.device = get_default_device()
+            return
+
         if gpus_to_use is None:
             # if not specified, use only the current GPU by default
             gpus_to_use = [torch.cuda.current_device()]
